@@ -73,8 +73,8 @@ fn hotStoreCapacity(min_len: usize) usize {
 
 pub const AiMemoryConfig = struct {
     /// When non-null, only these dense ai-store indices participate this step
-    /// (the scope system's cognition halo + stagger selection). Null = all
-    /// agents. Mirrors `AiConfig.scope_dense_indices`/
+    /// (the scope system's think set: halo ∩ stagger). Null = all agents.
+    /// Mirrors `AiConfig.scope_dense_indices` /
     /// `PerceptionConfig.scope_dense_indices` exactly.
     scope_dense_indices: ?[]const u32 = null,
     items_per_range: ?usize = null,

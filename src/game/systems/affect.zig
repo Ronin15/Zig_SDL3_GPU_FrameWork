@@ -107,8 +107,8 @@ const no_memory_familiarity: f32 = 1.0;
 
 pub const AffectConfig = struct {
     /// When non-null, only these dense ai-store indices participate this step
-    /// (the scope system's cognition halo + stagger selection). Null = all
-    /// agents. Mirrors AiMemoryConfig/PerceptionConfig.scope_dense_indices.
+    /// (the scope system's think set: halo ∩ stagger). Null = all agents.
+    /// Mirrors AiMemoryConfig/PerceptionConfig.scope_dense_indices.
     scope_dense_indices: ?[]const u32 = null,
     /// Deterministic per-step cap on emitted threshold-crossing events,
     /// enforced by this system itself (mirrors PerceptionConfig).

@@ -59,13 +59,13 @@ commit/domain reactions, and render-prep reservation at the state boundary; it
 passes the borrowed audio command buffer through the pipeline-owned
 `AudioController` rather than holding audio policy itself.
 `SimulationPipeline` opens each step with the backbone **scope pass** (stagger
-advance and the tier/halo/stagger gathers that select which entities enter each
-stage; chunk columns are derived later in a dedicated `chunk_derive` stage from
-each body's final settled position — not in-pass during movement), builds the
-shared **spatial index** (`SpatialIndexSystem`, Slice 28) from that same
-cognition-scoped population for AI separation queries, runs the
-**perception stage** (`PerceptionSystem`, Slice 29) over the cognition-scoped
-`AiPerception` subset against that same spatial index (range/FOV/line-of-sight,
+advance and the two-population gather: unstaggered cognition halo plus the
+stagger-filtered think set; chunk columns are derived later in a dedicated
+`chunk_derive` stage from each body's final settled position — not in-pass
+during movement), builds the shared **spatial index** (`SpatialIndexSystem`,
+Slice 28) from the unstaggered halo for neighbor queries, runs the
+**perception stage** (`PerceptionSystem`, Slice 29) with halo **candidates**
+and think-set **observers** against that same spatial index (range/FOV/line-of-sight,
 writing sensed state to `PerceptionStore`), then the **memory stage**
 (`AiMemorySystem`, Slice 30) over the cognition-scoped `AiPerception`+`AiMemory`
 subset (decaying staleness/familiarity/ring contacts and refreshing from this

@@ -3,7 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Pipeline-owned shared spatial index (Slice 28). Builds one uniform grid per
-//! fixed step from the cognition-scoped population and exposes a bounded,
+//! fixed step from the unstaggered cognition-halo population and exposes a bounded,
 //! radius-parameterized neighbor-query API. Replaces the private per-step grid
 //! `AiSystem` used to build for separation and is the substrate future
 //! perception queries (Slice 29) reuse instead of building a second grid.
@@ -11,21 +11,21 @@
 //! tuned sweep-and-prune order (`systems/collision.zig`) that is a different,
 //! already-tuned algorithm, not a duplicate grid build.
 //!
-//! Scope: indexes only the cognition-scoped population passed via
-//! `SpatialIndexConfig.scope_dense_indices` (halo + stagger gated), not every
-//! movement body — every current and planned consumer already gates on that
-//! same set, so indexing the full population would spend build cost on
-//! entities nothing queries this step. A future consumer that needs a broader
-//! candidate pool is the intentional widening point, not an oversight.
+//! Scope: indexes the cognition-halo population passed via
+//! `SpatialIndexConfig.scope_dense_indices` (tier + camera halo, **no** stagger),
+//! not every movement body. Perception candidates walk the same list; think-set
+//! observers/deciders are a stagger subset and map into these rows via
+//! `spatial_self_index`. Indexing the full movement population would spend
+//! build cost on entities nothing queries this step.
 //!
-//! Population-domain contract (also documented in `ai.zig`): `build`/`buildSerial`
-//! walk `scope_dense_indices` (or all ai agents) resolving
-//! `data.movementBodyDenseIndex(entity) orelse continue`, exactly mirroring
-//! `AiSystem.gatherAiData`'s selection. This is a deliberate duplicate gather
-//! (not shared code): it keeps both systems' call shapes independent while
-//! guaranteeing row-index equivalence by construction — index row `i` and
-//! `AiSystem.rows` row `i` refer to the same agent, so query results plug
-//! straight into AI's arrays with zero translation.
+//! Population-domain contract (also documented in `ai.zig`/`perception.zig`):
+//! `build`/`buildSerial` walk `scope_dense_indices` (or all ai agents) resolving
+//! `data.movementBodyDenseIndex(entity) orelse continue`, exactly mirroring the
+//! halo candidate walks. This is a deliberate duplicate gather (not shared
+//! code): index row `i` and each system's `candidates` row `i` refer to the
+//! same agent. Think rows are a subset and must not be used as spatial
+//! self-indices. Single-list callers (null halo, think == halo) keep the
+//! equal-length path.
 //!
 //! Determinism-critical: floating-point neighbor-direction summation is not
 //! associative, so callers that need bit-exact parity with a per-cell scan
@@ -219,7 +219,8 @@ pub const SpatialIndexConfig = struct {
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
     /// When non-null, only these dense ai-store indices participate this step
-    /// (mirrors `AiConfig.scope_dense_indices`). Null = all ai agents.
+    /// (the unstaggered cognition halo; mirrors perception's candidate list).
+    /// Null = all ai agents.
     scope_dense_indices: ?[]const u32 = null,
 };
 

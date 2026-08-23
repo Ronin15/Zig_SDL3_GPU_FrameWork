@@ -469,9 +469,12 @@ Processors keep their hot loops and receive a `scope_dense_indices` option
 (null = full-active) instead of learning world/chunk policy. Movement and
 collision gate on tier only (no chunk filter, so off-screen entities keep moving
 and colliding) and short-circuit to full-active in O(1) via incremental
-`tier_counts` when nothing is dormant/kinematic; AI gates on tier + camera halo +
-a per-entity stagger cadence; steering inherits that scope transitively through the
-navigation-intent stream. Tier wake/sleep changes flow through deferred
+`tier_counts` when nothing is dormant/kinematic; **cognition thinking** (perception
+observers, memory, affect, AI decide) gates on tier + camera halo + a per-entity
+stagger cadence, while the shared spatial index and perception **candidates** are
+built from the unstaggered cognition halo so off-phase agents remain visible;
+steering inherits think-set scope transitively through the navigation-intent
+stream. Tier wake/sleep changes flow through deferred
 `set_simulation_tier` structural commands at the commit seam, never inside worker
 ranges. CPU benchmarks at 50k scale are throughput ceilings for rare spikes;
 typical frames scope active work far lower.
@@ -495,8 +498,9 @@ or transient range streams; only notable transitions become low-volume domain
 events (`entity_perceived` / `entity_lost`, `affect_threshold_crossed`, and
 similar). Cross-entity classification (faction/stance), a deterministic
 per-entity RNG facility in `src/core`, and a shared per-frame spatial index are
-shared substrate these stages consume. Because they run only for in-scope
-cognition entities, their cost scales with active scope, not total entity count.
+shared substrate these stages consume. Because they *think* only for in-halo, on-phase cognition entities, their
+think cost scales with the stagger-filtered set (~N/4), not total entity
+count; the shared index and candidate table scale with the unstaggered halo.
 
 **Emotion model (Slice 31 substrate):** `AiAffect` stores independent scalar
 drives (`fear`, `curiosity`, `aggression`, `fatigue`) in `[0, 1]`, each with
@@ -606,9 +610,9 @@ capacity error.
 It receives const AiAgent + movement prior-position slices and a read-only
 `SpatialIndexView` from the pipeline-owned `SpatialIndexSystem`
 (`src/game/systems/spatial_index.zig`, Slice 28) — the shared per-step spatial
-index, built once from the same cognition-scoped population, that AI
+index, built once from the unstaggered cognition halo, that AI
 separation queries for bounded local-separation samples instead of building
-its own grid. Per row, `AiSystem` gathers perception/memory/affect signals
+its own grid. Think rows map into halo rows via `spatial_self_index`. Per row, `AiSystem` gathers perception/memory/affect signals
 (each independently optional; an absent component contributes zero signal)
 into `arbitration.Signals` and runs them through
 `src/game/systems/arbitration.zig`'s pure utility-arbitration chain:

@@ -6,7 +6,7 @@ feature chunk with a **Goal**, **Checklist**, and **Acceptance checks**. Agents
 implement by opening a slice section, checking items off only when integrated,
 and running `zig build verify` before marking the slice complete.
 
-Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 39–41, 45) live in
+Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 39–41, 45, 47) live in
 [framework-implementation-slices-archive.md](framework-implementation-slices-archive.md).
 This file is the **open frontier**: agent workflow, priorities, Scaling Gaps,
 track overviews, and open slice sections only. Landed slices that still need
@@ -88,10 +88,9 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **43** | Landed (manual HW verification pending) | SDL3 gamepad/controller support — single active device, analog movement, default button bindings (app/input layer; independent of AI/render tracks) |
 | **44** | Not started | Input rebinding UI + extended gamepad controls (right stick / triggers) — completes controls deferred by Slice 43 |
 | **46** | Not started | Save/load persistence — serialize `DataSystem`/`WorldSystem` by stable IDs; completes archive Slice 10's designed boundary |
-| **47** | Not started | **Live perception defect:** un-stagger the shared spatial index / perception candidate set so cognition NPCs can perceive each other (stagger gates thinking only). **Highest-priority correctness item on the AI track** |
 | **48** | Not started | SimulationPipeline thin-composer restoration — bind `stage_order` to execution, extract `SensoryBus`, evict movement/world domain logic, own event/allocation budgets. Land as independent steps |
 
-**Recently settled (archive only):** 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
+**Recently settled (archive only):** 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 **Residual non-slice backlog:** optional render micro-opts (e.g. an O(n) linear
 `mergeDrawList`) — see **Scaling Gaps**, not a live slice body. (The 23A
 `expand2`→`world` merge is settled: `expand2`/`world` are merged into `main`.)
@@ -103,13 +102,14 @@ Use this index to choose the next slice; **implement from that slice's section**
 Sequencing hints only — **does not replace slice Checklists**. When in doubt,
 follow **Suggested Order** and the open items in the target slice section.
 
-**Locomotion emergence is closed** (archive 26–32, 39, 41; frontier residual 33
+**Locomotion emergence is closed** (archive 26–32, 39, 41, 47; frontier residual 33
 visual only). Multi-source investigate (stimuli + world markers + memory) and
 table-driven affect→behavior are in place. Open work grows *beside* that loop.
 
 | Track | Slices | Notes |
 | --- | --- | --- |
 | **Primary — action/interaction** | archive **40** + **45** | Action-intent substrate + first domain controller (destructibles) landed; future combat/rules consumers reuse the same bus. |
+| **Pipeline composer** | **48** | Thin-composer restoration after 47's two-population split. Independent landable steps. |
 | **Feelings growth** | **42** | More drives / coupling / gains only when a real appraisal signal exists (often from 40/45 combat or other producers) — no dead enum tags. |
 | **World / render verticality** | **37 → 38** | Cap raise + shader sync, then elevation-above-surface semantics. Independent of AI. |
 | **Input polish** | **44** (after 43 residual) | Rebind UI + right stick/triggers; binding persistence optional in **46**. |
@@ -341,7 +341,7 @@ by Slice 24.
 | World interest | 41 | Landed (archive) | Durable investigate/cover/resource/patrol markers; investigate wired |
 | Action intents | 40 | Landed (archive) | Non-locomotion intent stream (attack/interact/use); player R capture |
 | First action consumer | 45 | Landed (archive) | `DestructibleController` at `action_react`; deferred destroy + domain event |
-| Sensing substrate fix | 47 | **Open (live defect)** | Un-stagger the shared spatial index / perception candidates so cognition NPCs perceive each other; stagger gates thinking only |
+| Sensing substrate fix | 47 | **Landed (archive)** | Unstaggered halo spatial index + perception candidates; stagger gates observers/deciders only |
 | **Affect expansion** | **42** | **Open** | More drives, cross-drive coupling, data-driven appraisal gains, optional mood |
 
 ### Emotion / feelings model (landed + expandability)
@@ -420,9 +420,11 @@ footstep / deferred impact) and world interest markers (41: investigate wired;
 - **Slice 33** — authoring/tuning infrastructure (landed; visual/`gpu-smoke`
   residual only).
 - **Slices 39, 41** — richer senses + world-authored investigate POIs (landed).
-- **Open post-loop expandability:** **45** (first action consumer; **next**),
-  **42** (more/coupled feelings). Action intents (**40**) are landed. Each is
-  a full slice — do not half-wire into 32 or overload `NavigationIntent`.
+- **Open post-loop expandability:** **42** (more/coupled feelings, only with a
+  real appraisal signal). Action intents (**40**) and first consumer (**45**)
+  are landed. Sensing substrate (**47**) is landed. Each remaining item is a
+  full slice — do not half-wire into 32 or overload `NavigationIntent`.
+  Next on this track's structural work is **48** (thin-composer restoration).
 
 Shared design contracts for the whole track:
 
@@ -1222,73 +1224,6 @@ only stable IDs and enum/scalar columns, never paths or live handles.
 - [ ] Serialized form contains no handles or filesystem paths (payload-purity
       inspection/test); `zig build verify` passes.
 
-## Slice 47: Un-Stagger The Shared Sensing Substrate
-
-**Status: not started. Live perception defect** surfaced by the architecture
-review — perception-carrying NPCs cannot perceive one another in the shipped
-demo. Highest-priority correctness item on the AI track; land it before Slice 48.
-
-Goal: build the shared spatial index and perception candidate set over the full
-cognition-halo population, using cognition stagger only to choose which agents
-*think* this step — so two observers on different stagger phases can sense each
-other, and a timid `.ally` can see the hostile it is meant to flee.
-
-### Problem (verified against live code)
-
-- `simulation_pipeline.zig`'s `update()` hands the stagger-filtered
-  `ai_indices` to `spatial_index.build`, and perception re-walks the same list.
-  The shared neighbor grid and the perception candidate set therefore contain
-  only one stagger cohort per step.
-- `ai_archetypes.archetype_count = 8` and `simulation_scope.cognition_stagger_n
-  = 4`, and demo spawns cycle archetypes by index, so archetype slot permanently
-  pins stagger phase. The perception-carrying demo archetypes land on distinct
-  phases → no observer can ever appear in another observer's candidate set.
-- `perception.zig` gates the unconditional player fold-in on hostile stance, so
-  the `.ally` timid archetype (designed to flee hostiles) has no candidates at
-  all once its own cohort is filtered out.
-- This is broken today, not a latent risk. The sticky-stimulus linger and the
-  unconditional player candidate are the two demo-visible patches over the same
-  hazard class; this slice fixes the general case.
-
-### Architecture notes
-
-- Split the two roles the single `ai_indices` list conflates: build the spatial
-  index and perception's candidate table over the full cognition-halo population
-  (tier + halo, **no** stagger filter); pass the stagger-filtered list only as
-  the observer/decider (thinking) set. Think budget stays ~N/4; the candidate
-  set becomes complete. The index build is the SIMD/threaded pass, so it is the
-  cheapest stage to un-stagger.
-- Coupling cost (verified): `ai.zig`'s `cohereNeighborVisit` indexes
-  `ctx.candidate_faction[candidate_index]` with a **spatial** row index, so it
-  hard-requires index-row == AI-row identity. Un-staggering requires giving
-  `ai.zig` a candidates side table + `spatial_self_index` mapping — the pattern
-  `perception.zig` already implements; copy it. Preserve serial==threaded and
-  scalar==SIMD parity.
-- Optional diagnostic dividend (coordinate with Slice 48): rename
-  `.ai_scope_indices` into `ai_halo_indices` (index/candidate population) vs
-  `ai_cognition_indices` (thinking population) so the two populations are
-  distinct names in the comptime graph.
-- All per-step caps stay fixed and world-size-independent; determinism preserved.
-
-### Checklist
-
-- [ ] `spatial_index.build` and perception's candidate gather run over the
-      unstaggered cognition-halo population.
-- [ ] Cognition stagger applies only to the observer/decider (thinking) set.
-- [ ] `ai.zig` gains a candidates side table + `spatial_self_index` mapping so
-      cohere neighbor queries no longer assume index-row == AI-row.
-- [ ] Test with a non-null `cognition_region` and two observers on different
-      stagger phases asserting mutual perception (whole class untested today —
-      fixtures pass null).
-- [ ] Verify a timid `.ally` perceives a hostile once its cohort is not filtered.
-
-### Acceptance checks
-
-- [ ] Two cognition observers on distinct stagger phases perceive each other in
-      the same step.
-- [ ] Serial==threaded and scalar==SIMD parity hold; think budget stays ~N/4.
-- [ ] No AI/perception bench regression at battle scale; `zig build verify` passes.
-
 ## Slice 48: SimulationPipeline Thin-Composer Restoration
 
 **Status: not started.** Structural refactor surfaced by the architecture
@@ -1457,6 +1392,7 @@ actually runs and the composer stops owning cross-step state and policy.
 46. Save/load persistence (independent; benefits from 44 for binding
     persistence).
 47. Un-stagger the shared sensing substrate (live perception defect; before 48).
+    — landed (archive).
 48. SimulationPipeline thin-composer restoration (after 47; independent landable
     steps — contract vocab → bind graph → extract SensoryBus → evict domain
     logic → own budgets).

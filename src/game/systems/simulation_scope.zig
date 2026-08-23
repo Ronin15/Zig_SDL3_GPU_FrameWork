@@ -16,12 +16,14 @@
 //!     tier_policy (same step) and next-step gathers see final world positions.
 //!     Movement/collision gate on tier only — no chunk filter.
 //!
-//! Stage participation rules (Slice 24):
+//! Stage participation rules (Slice 24 / Slice 47):
 //!   movement   — tier.allowsMovement()  — no chunk filter
 //!   collision  — tier.allowsCollision() — no chunk filter
-//!   ai/steering — tier.allowsCognition() AND chunk inside cognition halo
-//!                 AND stagger_phase == step % cognition_stagger_n
-//!                 (always_active entities bypass halo and stagger)
+//!   spatial index / perception candidates — cognition halo, no stagger
+//!   ai / perception observers / memory / affect / decide —
+//!                 halo ∩ (stagger_phase == step % cognition_stagger_n)
+//!                 (always_active entities bypass halo and stagger;
+//!                 `cognition_region == null` applies neither halo nor stagger)
 //!
 //! Each O(N)-per-step pass threads like the other processors: the gathers are
 //! stream-compactions (per-range index buffers merged in range order); the tier
@@ -80,10 +82,14 @@ pub const ScopeGatherResult = struct {
     batch: BatchStats = .{},
 };
 
-/// Threaded gather result for the AI pass. Unlike movement/collision it never
-/// short-circuits to full-active, so `indices` is always the merged list.
-pub const AiGatherResult = struct {
-    indices: []const u32,
+/// Threaded gather result for the two AI populations. Unlike movement/collision
+/// it never short-circuits to full-active. `halo` is the unstaggered cognition
+/// set (spatial index + perception candidates); `cognition` is the stagger
+/// subset that thinks this step (observers, memory, affect, AI decide). When
+/// `cognition_region` is null the two slices are identical (no halo, no stagger).
+pub const AiPopulationGatherResult = struct {
+    halo: []const u32,
+    cognition: []const u32,
     batch: BatchStats = .{},
 };
 
@@ -93,11 +99,15 @@ pub const SimulationScopeSystem = struct {
     step_count: u32,
     /// Warmed collision dense-index list. null return = full-active (no dormant/kinematic with bounds).
     collision_indices: std.ArrayList(u32) = .empty,
-    /// Warmed AI agent dense-index list (cognition halo + stagger filtered).
-    /// Steering scopes transitively off the navigation intents AI emits for these
-    /// agents, so there is no separate steering gather (a second filter would
-    /// double-gate the already-scoped intents).
-    ai_indices: std.ArrayList(u32) = .empty,
+    /// Warmed AI agent dense-index list: cognition-tier agents inside the camera
+    /// halo (no stagger). Spatial index and perception candidates consume this.
+    /// `always_active` agents are included even outside the halo.
+    ai_halo_indices: std.ArrayList(u32) = .empty,
+    /// Warmed think-set subset of `ai_halo_indices` (stagger_phase == this step,
+    /// plus `always_active`). Perception observers, memory, affect, and AI decide
+    /// consume this. Steering scopes transitively off the navigation intents AI
+    /// emits for these agents, so there is no separate steering gather.
+    ai_cognition_indices: std.ArrayList(u32) = .empty,
     /// Warmed scratch for the per-step auto wake/sleep tier commands this system
     /// produces. Owned here beside the other scratch, written into the frame's
     /// structural-command stream by queueTierChangesSerial.
@@ -138,7 +148,8 @@ pub const SimulationScopeSystem = struct {
         for (self.collision_gather_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
         self.collision_gather_ranges.deinit(self.allocator);
         self.scope_tier_commands.deinit(self.allocator);
-        self.ai_indices.deinit(self.allocator);
+        self.ai_cognition_indices.deinit(self.allocator);
+        self.ai_halo_indices.deinit(self.allocator);
         self.collision_indices.deinit(self.allocator);
     }
 
@@ -147,7 +158,8 @@ pub const SimulationScopeSystem = struct {
     /// The threaded per-range slot buffers still warm on their first threaded step.
     pub fn reserve(self: *SimulationScopeSystem, capacity: usize) !void {
         try self.collision_indices.ensureTotalCapacity(self.allocator, capacity);
-        try self.ai_indices.ensureTotalCapacity(self.allocator, capacity);
+        try self.ai_halo_indices.ensureTotalCapacity(self.allocator, capacity);
+        try self.ai_cognition_indices.ensureTotalCapacity(self.allocator, capacity);
         try self.scope_tier_commands.ensureTotalCapacity(self.allocator, capacity);
     }
 
@@ -296,27 +308,29 @@ pub const SimulationScopeSystem = struct {
         return if (any_excluded) self.collision_indices.items else null;
     }
 
-    // ---- AI gather (threaded compaction + diagnostics) -----------------------
+    // ---- AI gather (threaded halo compaction + serial think compact) ---------
 
-    /// Build the AI agent dense-index list. Filters by cognition tier, chunk inside
-    /// cognition halo, and stagger cadence. always_active entities bypass halo +
-    /// stagger. Accumulates stagger_skips and chunk_filtered_entities per range,
-    /// summed on merge for diagnostics.
-    pub fn gatherAiAgentIndices(
+    /// Build the two AI populations for this step. The threaded job writes the
+    /// unstaggered halo (cognition tier + region; `always_active` included).
+    /// A main-thread compact then copies the stagger-matching subset into the
+    /// think list. `cognition_region == null` copies halo into cognition with
+    /// no stagger filter (preserves the full-active fallback).
+    pub fn gatherAiPopulations(
         self: *SimulationScopeSystem,
         data: *const DataSystem,
         cognition_region: ?ActiveRegion,
         stagger_step: u8,
         thread_system: *ThreadSystem,
         config: ScopeConfig,
-    ) !AiGatherResult {
+    ) !AiPopulationGatherResult {
         const ai = data.aiAgentSliceConst();
         const n = ai.entities.len;
         self.stagger_skips = 0;
         self.chunk_filtered_entities = 0;
         if (n == 0) {
-            self.ai_indices.clearRetainingCapacity();
-            return .{ .indices = self.ai_indices.items };
+            self.ai_halo_indices.clearRetainingCapacity();
+            self.ai_cognition_indices.clearRetainingCapacity();
+            return .{ .halo = self.ai_halo_indices.items, .cognition = self.ai_cognition_indices.items };
         }
 
         const scope = data.scopeColumnsSliceConst();
@@ -327,7 +341,7 @@ pub const SimulationScopeSystem = struct {
             .ai_entities = ai.entities,
             .scope = scope,
             .cognition_region = cognition_region,
-            .stagger_step = stagger_step,
+            .item_count = n,
             .ranges = self.ai_gather_ranges.items[0..selection.range_count],
         };
         const batch = thread_system.parallelForWithOptions(n, &context, aiGatherJob, .{
@@ -336,31 +350,39 @@ pub const SimulationScopeSystem = struct {
             .adaptive_tuner = selection.active_tuner,
             .selected_profile = selection.profile,
         });
-        const merged = try self.mergeIndexRanges(&self.ai_indices, self.ai_gather_ranges.items[0..selection.range_count]);
-        self.stagger_skips = merged.stagger_skips;
+        const merged = try self.mergeIndexRanges(&self.ai_halo_indices, self.ai_gather_ranges.items[0..selection.range_count]);
         self.chunk_filtered_entities = merged.chunk_filtered;
-        return .{ .indices = self.ai_indices.items, .batch = batch };
+        try self.compactCognitionFromHalo(data, stagger_step, cognition_region != null);
+        return .{
+            .halo = self.ai_halo_indices.items,
+            .cognition = self.ai_cognition_indices.items,
+            .batch = batch,
+        };
     }
 
-    pub fn gatherAiAgentIndicesSerial(
+    pub fn gatherAiPopulationsSerial(
         self: *SimulationScopeSystem,
         data: *const DataSystem,
         cognition_region: ?ActiveRegion,
         stagger_step: u8,
-    ) ![]const u32 {
+    ) !AiPopulationGatherResult {
         const ai = data.aiAgentSliceConst();
-        self.ai_indices.clearRetainingCapacity();
+        self.ai_halo_indices.clearRetainingCapacity();
+        self.ai_cognition_indices.clearRetainingCapacity();
         self.stagger_skips = 0;
         self.chunk_filtered_entities = 0;
-        if (ai.entities.len == 0) return self.ai_indices.items;
-        try self.ai_indices.ensureTotalCapacity(self.allocator, ai.entities.len);
+        if (ai.entities.len == 0) {
+            return .{ .halo = self.ai_halo_indices.items, .cognition = self.ai_cognition_indices.items };
+        }
+        try self.ai_halo_indices.ensureTotalCapacity(self.allocator, ai.entities.len);
+        try self.ai_cognition_indices.ensureTotalCapacity(self.allocator, ai.entities.len);
 
         const scope = data.scopeColumnsSliceConst();
         for (ai.entities, 0..) |ent, i| {
             const di = data.movementBodyDenseIndex(ent) orelse continue;
             if (!scope.tier[di].allowsCognition()) continue;
             if (scope.always_active[di]) {
-                self.ai_indices.appendAssumeCapacity(@intCast(i));
+                self.ai_halo_indices.appendAssumeCapacity(@intCast(i));
                 continue;
             }
             if (cognition_region) |region| {
@@ -368,14 +390,42 @@ pub const SimulationScopeSystem = struct {
                     self.chunk_filtered_entities += 1;
                     continue;
                 }
-                if (scope.stagger_phase[di] != stagger_step) {
-                    self.stagger_skips += 1;
-                    continue;
-                }
             }
-            self.ai_indices.appendAssumeCapacity(@intCast(i));
+            self.ai_halo_indices.appendAssumeCapacity(@intCast(i));
         }
-        return self.ai_indices.items;
+        try self.compactCognitionFromHalo(data, stagger_step, cognition_region != null);
+        return .{ .halo = self.ai_halo_indices.items, .cognition = self.ai_cognition_indices.items };
+    }
+
+    /// Compacts `ai_halo_indices` into `ai_cognition_indices`. When `apply_stagger`
+    /// is false (null cognition region) the lists are identical. `stagger_skips`
+    /// counts in-halo agents whose phase does not match this step.
+    fn compactCognitionFromHalo(
+        self: *SimulationScopeSystem,
+        data: *const DataSystem,
+        stagger_step: u8,
+        apply_stagger: bool,
+    ) !void {
+        const halo = self.ai_halo_indices.items;
+        self.ai_cognition_indices.clearRetainingCapacity();
+        try self.ai_cognition_indices.ensureTotalCapacity(self.allocator, halo.len);
+        if (!apply_stagger) {
+            self.ai_cognition_indices.items.len = halo.len;
+            if (halo.len != 0) @memcpy(self.ai_cognition_indices.items, halo);
+            return;
+        }
+
+        const ai = data.aiAgentSliceConst();
+        const scope = data.scopeColumnsSliceConst();
+        for (halo) |ai_index| {
+            const ent = ai.entities[ai_index];
+            const di = data.movementBodyDenseIndex(ent) orelse continue;
+            if (scope.always_active[di] or scope.stagger_phase[di] == stagger_step) {
+                self.ai_cognition_indices.appendAssumeCapacity(ai_index);
+            } else {
+                self.stagger_skips += 1;
+            }
+        }
     }
 
     // ---- Simulation-LOD tier policy (threaded variable-output producer) -------
@@ -730,14 +780,17 @@ const AiGatherContext = struct {
     ai_entities: []const EntityId,
     scope: ConstScopeColumnsSlice,
     cognition_region: ?ActiveRegion,
-    stagger_step: u8,
+    item_count: usize,
     ranges: []IndexRangeSlot,
 };
 
 fn aiGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *AiGatherContext = @ptrCast(@alignCast(context));
-    // Guards the reserve-before-dispatch invariant: ranges was sized to this dispatch's range count.
+    // Dual worker asserts (mirror spatial_index.zig / collision.zig): range.index vs
+    // dispatched range count AND range.end vs the candidate buffer this job walks.
     std.debug.assert(range.index < job.ranges.len);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.item_count);
     const buffer = &job.ranges[range.index].buffer;
     const scope = job.scope;
     for (range.start..range.end) |i| {
@@ -751,10 +804,6 @@ fn aiGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         if (job.cognition_region) |region| {
             if (!region.containsChunk(.{ .x = scope.chunk_x[di], .y = scope.chunk_y[di] })) {
                 buffer.chunk_filtered += 1;
-                continue;
-            }
-            if (scope.stagger_phase[di] != job.stagger_step) {
-                buffer.stagger_skips += 1;
                 continue;
             }
         }
@@ -838,9 +887,11 @@ test "SimulationScopeSystem AI gather filters halo and stagger" {
     defer sys.deinit();
 
     const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
-    const indices = try sys.gatherAiAgentIndicesSerial(&data, region, 0);
+    const pops = try sys.gatherAiPopulationsSerial(&data, region, 0);
 
-    try std.testing.expectEqual(@as(usize, 1), indices.len);
+    try std.testing.expectEqual(@as(usize, 1), pops.halo.len);
+    try std.testing.expectEqual(@as(usize, 1), pops.cognition.len);
+    try std.testing.expectEqual(pops.halo[0], pops.cognition[0]);
     try std.testing.expectEqual(@as(usize, 1), sys.chunk_filtered_entities);
     try std.testing.expectEqual(@as(usize, 0), sys.stagger_skips);
 }
@@ -863,8 +914,9 @@ test "SimulationScopeSystem AI stagger skips wrong phase" {
     defer sys.deinit();
 
     const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
-    const indices = try sys.gatherAiAgentIndicesSerial(&data, region, 1);
-    try std.testing.expectEqual(@as(usize, 0), indices.len);
+    const pops = try sys.gatherAiPopulationsSerial(&data, region, 1);
+    try std.testing.expectEqual(@as(usize, 1), pops.halo.len);
+    try std.testing.expectEqual(@as(usize, 0), pops.cognition.len);
     try std.testing.expectEqual(@as(usize, 1), sys.stagger_skips);
 }
 
@@ -887,10 +939,106 @@ test "SimulationScopeSystem always_active bypasses halo and stagger" {
     defer sys.deinit();
 
     const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
-    const indices = try sys.gatherAiAgentIndicesSerial(&data, region, 0);
-    try std.testing.expectEqual(@as(usize, 1), indices.len);
+    const pops = try sys.gatherAiPopulationsSerial(&data, region, 0);
+    try std.testing.expectEqual(@as(usize, 1), pops.halo.len);
+    try std.testing.expectEqual(@as(usize, 1), pops.cognition.len);
     try std.testing.expectEqual(@as(usize, 0), sys.chunk_filtered_entities);
     try std.testing.expectEqual(@as(usize, 0), sys.stagger_skips);
+}
+
+test "AI halo includes off-phase agents; cognition excludes them" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+
+    const phase0 = try data.createEntity();
+    try data.setMovementBody(phase0, .{});
+    try data.setAiAgent(phase0, .{});
+    try data.setSimulationMetadata(phase0, .{
+        .tier = .cognition,
+        .chunk = .{ .x = 1, .y = 1 },
+        .stagger_phase = 0,
+    });
+
+    const phase1 = try data.createEntity();
+    try data.setMovementBody(phase1, .{});
+    try data.setAiAgent(phase1, .{});
+    try data.setSimulationMetadata(phase1, .{
+        .tier = .cognition,
+        .chunk = .{ .x = 1, .y = 1 },
+        .stagger_phase = 1,
+    });
+
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+
+    const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
+    const pops = try sys.gatherAiPopulationsSerial(&data, region, 0);
+    try std.testing.expectEqual(@as(usize, 2), pops.halo.len);
+    try std.testing.expectEqual(@as(usize, 1), pops.cognition.len);
+    try std.testing.expectEqual(@as(u32, 0), pops.cognition[0]);
+    try std.testing.expectEqual(@as(usize, 1), sys.stagger_skips);
+    try std.testing.expectEqual(@as(usize, 0), sys.chunk_filtered_entities);
+}
+
+test "null cognition region keeps halo identical to cognition with no stagger" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+
+    const phase0 = try data.createEntity();
+    try data.setMovementBody(phase0, .{});
+    try data.setAiAgent(phase0, .{});
+    try data.setSimulationMetadata(phase0, .{
+        .tier = .cognition,
+        .chunk = .{ .x = 1, .y = 1 },
+        .stagger_phase = 0,
+    });
+
+    const phase1 = try data.createEntity();
+    try data.setMovementBody(phase1, .{});
+    try data.setAiAgent(phase1, .{});
+    try data.setSimulationMetadata(phase1, .{
+        .tier = .cognition,
+        .chunk = .{ .x = 99, .y = 99 },
+        .stagger_phase = 1,
+    });
+
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+
+    const pops = try sys.gatherAiPopulationsSerial(&data, null, 0);
+    try std.testing.expectEqual(@as(usize, 2), pops.halo.len);
+    try std.testing.expectEqualSlices(u32, pops.halo, pops.cognition);
+    try std.testing.expectEqual(@as(usize, 0), sys.stagger_skips);
+    try std.testing.expectEqual(@as(usize, 0), sys.chunk_filtered_entities);
+}
+
+test "think budget is one stagger slot of an in-halo four-phase set" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+
+    for (0..4) |phase| {
+        const e = try data.createEntity();
+        try data.setMovementBody(e, .{});
+        try data.setAiAgent(e, .{});
+        try data.setSimulationMetadata(e, .{
+            .tier = .cognition,
+            .chunk = .{ .x = 0, .y = 0 },
+            .stagger_phase = @intCast(phase),
+        });
+    }
+
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+
+    const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 1, .y = 1 });
+    const pops = try sys.gatherAiPopulationsSerial(&data, region, 2);
+    try std.testing.expectEqual(@as(usize, 4), pops.halo.len);
+    try std.testing.expectEqual(@as(usize, 1), pops.cognition.len);
+    try std.testing.expectEqual(@as(u32, 2), pops.cognition[0]);
+    try std.testing.expectEqual(@as(usize, 3), sys.stagger_skips);
 }
 
 test "collectChunkTierChanges assigns all four LOD tiers by distance band" {
@@ -1144,10 +1292,11 @@ test "scoped AI emits navigation intents only for in-halo, on-phase agents" {
     var sys = SimulationScopeSystem.init(allocator);
     defer sys.deinit();
     const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
-    const indices = try sys.gatherAiAgentIndicesSerial(&data, region, sys.staggerStep());
+    const pops = try sys.gatherAiPopulationsSerial(&data, region, sys.staggerStep());
 
-    // Only the in-halo, phase-0 agent survives the gather at step 0.
-    try std.testing.expectEqual(@as(usize, 1), indices.len);
+    // Halo keeps the in-halo off-phase agent; cognition is the on-phase subset.
+    try std.testing.expectEqual(@as(usize, 2), pops.halo.len);
+    try std.testing.expectEqual(@as(usize, 1), pops.cognition.len);
     try std.testing.expectEqual(@as(usize, 1), sys.chunk_filtered_entities);
     try std.testing.expectEqual(@as(usize, 1), sys.stagger_skips);
 
@@ -1162,11 +1311,14 @@ test "scoped AI emits navigation intents only for in-halo, on-phase agents" {
     const ai_slice = data.aiAgentSliceConst();
     const movement_slice = data.movementBodySliceConst();
     try spatial_sys.reserve(ai_slice.entities.len, .{});
-    _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &data, .{ .scope_dense_indices = indices });
+    _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &data, .{ .scope_dense_indices = pops.halo });
 
     var ai_sys = ai.AiSystem.init(allocator);
     defer ai_sys.deinit();
-    _ = try ai_sys.updateSerial(ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .scope_dense_indices = indices });
+    _ = try ai_sys.updateSerial(ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .scope_dense_indices = pops.cognition,
+        .spatial_population_indices = pops.halo,
+    });
 
     // Exactly one navigation intent, for the selected agent — steering downstream
     // inherits this scoping with no separate gather.
@@ -1285,9 +1437,10 @@ test "threaded ai gather matches serial including diagnostics" {
     defer threaded_sys.deinit();
 
     const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
-    const serial = try serial_sys.gatherAiAgentIndicesSerial(&data, region, 0);
-    const threaded = (try threaded_sys.gatherAiAgentIndices(&data, region, 0, &threads, .{})).indices;
-    try std.testing.expectEqualSlices(u32, serial, threaded);
+    const serial = try serial_sys.gatherAiPopulationsSerial(&data, region, 0);
+    const threaded = try threaded_sys.gatherAiPopulations(&data, region, 0, &threads, .{});
+    try std.testing.expectEqualSlices(u32, serial.halo, threaded.halo);
+    try std.testing.expectEqualSlices(u32, serial.cognition, threaded.cognition);
     try std.testing.expectEqual(serial_sys.stagger_skips, threaded_sys.stagger_skips);
     try std.testing.expectEqual(serial_sys.chunk_filtered_entities, threaded_sys.chunk_filtered_entities);
 }
@@ -1371,9 +1524,10 @@ test "real worker threads match serial across every scope pass" {
     try std.testing.expectEqualSlices(u32, col_serial, col_threaded);
 
     // AI gather (with diagnostics).
-    const ai_serial = try serial_sys.gatherAiAgentIndicesSerial(&data, region, 0);
-    const ai_threaded = (try threaded_sys.gatherAiAgentIndices(&data, region, 0, &threads, fixed)).indices;
-    try std.testing.expectEqualSlices(u32, ai_serial, ai_threaded);
+    const ai_serial = try serial_sys.gatherAiPopulationsSerial(&data, region, 0);
+    const ai_threaded = try threaded_sys.gatherAiPopulations(&data, region, 0, &threads, fixed);
+    try std.testing.expectEqualSlices(u32, ai_serial.halo, ai_threaded.halo);
+    try std.testing.expectEqualSlices(u32, ai_serial.cognition, ai_threaded.cognition);
     try std.testing.expectEqual(serial_sys.stagger_skips, threaded_sys.stagger_skips);
     try std.testing.expectEqual(serial_sys.chunk_filtered_entities, threaded_sys.chunk_filtered_entities);
 
@@ -1449,8 +1603,9 @@ test "warmed scope threaded gathers and tier policy do not allocate (FailingAllo
     // step's shape (data does not change afterward, so re-running is identical).
     const warm_collision = try sys.gatherCollisionBoundsIndices(&data, &threads, .{});
     try std.testing.expect(warm_collision.indices != null);
-    const warm_ai = try sys.gatherAiAgentIndices(&data, ai_region, 0, &threads, .{});
-    try std.testing.expect(warm_ai.indices.len > 0);
+    const warm_ai = try sys.gatherAiPopulations(&data, ai_region, 0, &threads, .{});
+    try std.testing.expect(warm_ai.halo.len > 0);
+    try std.testing.expect(warm_ai.cognition.len > 0);
     _ = try sys.queueTierChanges(&data, visible_region, &stream, &threads, .{});
     try std.testing.expect(stream.mergedItems().len > 0);
 
@@ -1473,8 +1628,9 @@ test "warmed scope threaded gathers and tier policy do not allocate (FailingAllo
 
     const collision = try sys.gatherCollisionBoundsIndices(&data, &threads, .{});
     try std.testing.expectEqualSlices(u32, warm_collision.indices.?, collision.indices.?);
-    const ai_result = try sys.gatherAiAgentIndices(&data, ai_region, 0, &threads, .{});
-    try std.testing.expectEqualSlices(u32, warm_ai.indices, ai_result.indices);
+    const ai_result = try sys.gatherAiPopulations(&data, ai_region, 0, &threads, .{});
+    try std.testing.expectEqualSlices(u32, warm_ai.halo, ai_result.halo);
+    try std.testing.expectEqualSlices(u32, warm_ai.cognition, ai_result.cognition);
     _ = try sys.queueTierChanges(&data, visible_region, &stream, &threads, .{});
     try std.testing.expect(stream.mergedItems().len > 0);
 }

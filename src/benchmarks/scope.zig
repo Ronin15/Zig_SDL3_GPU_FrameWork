@@ -16,7 +16,8 @@
 //!   - movement integrates the full contiguous range every step; dormant rows
 //!     carry zero velocity and integrate as no-ops (no tier gather).
 //!   - collision runs on locomotion+cognition (drops dormant+kinematic).
-//!   - AI runs on the cognition subset, further gated by camera halo + stagger.
+//!   - AI thinks on the stagger-filtered cognition subset; the spatial index is
+//!     built from the unstaggered halo.
 //!   - chunk maintenance (deriveChunks) runs as its own pass over the settled
 //!     positions, recomputing every body's chunk before tier policy reads it.
 //!
@@ -292,26 +293,31 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
     // the *Serial variants, threaded cases the adaptive threaded gathers so the
     // scope stage's own tuners train inside the measured window.
     var collision_indices: ?[]const u32 = undefined;
-    var ai_indices: []const u32 = undefined;
+    var ai_halo_indices: []const u32 = undefined;
+    var ai_cognition_indices: []const u32 = undefined;
     if (thread_system) |ts| {
         collision_indices = (try ctx.scope.gatherCollisionBoundsIndices(&fixture.data, ts, scope_config)).indices;
-        ai_indices = (try ctx.scope.gatherAiAgentIndices(&fixture.data, region, ctx.scope.staggerStep(), ts, scope_config)).indices;
+        const pops = try ctx.scope.gatherAiPopulations(&fixture.data, region, ctx.scope.staggerStep(), ts, scope_config);
+        ai_halo_indices = pops.halo;
+        ai_cognition_indices = pops.cognition;
     } else {
         collision_indices = try ctx.scope.gatherCollisionBoundsIndicesSerial(&fixture.data);
-        ai_indices = try ctx.scope.gatherAiAgentIndicesSerial(&fixture.data, region, ctx.scope.staggerStep());
+        const pops = try ctx.scope.gatherAiPopulationsSerial(&fixture.data, region, ctx.scope.staggerStep());
+        ai_halo_indices = pops.halo;
+        ai_cognition_indices = pops.cognition;
     }
 
     const ai_slice = fixture.data.aiAgentSliceConst();
     const move_slice_const = fixture.data.movementBodySliceConst();
 
-    // Build the shared spatial index from this step's scoped population (same
-    // positions AI's own gather reads). Timed separately and excluded from the
-    // returned batch's reported window — see the `runCase` comment.
+    // Build the shared spatial index from this step's unstaggered halo (same
+    // positions the AI candidate walk reads). Timed separately and excluded from
+    // the returned batch's reported window — see the `runCase` comment.
     const spatial_start_ns = suite.nowNs(io);
     const spatial_stats = if (thread_system) |ts|
-        try ctx.spatial_index.build(ai_slice, move_slice_const, &fixture.data, ts, .{ .scope_dense_indices = ai_indices })
+        try ctx.spatial_index.build(ai_slice, move_slice_const, &fixture.data, ts, .{ .scope_dense_indices = ai_halo_indices })
     else
-        try ctx.spatial_index.buildSerial(ai_slice, move_slice_const, &fixture.data, .{ .scope_dense_indices = ai_indices });
+        try ctx.spatial_index.buildSerial(ai_slice, move_slice_const, &fixture.data, .{ .scope_dense_indices = ai_halo_indices });
     _ = spatial_stats;
     const spatial_end_ns = suite.nowNs(io);
     const excluded_ns = suite.elapsedNs(spatial_start_ns, spatial_end_ns);
@@ -328,7 +334,8 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
         _ = try ctx.ai.updateSerial(ai_slice, move_slice_const, spatial_view, &fixture.data, &fixture.frame, delta_seconds, .{
             .intent_seed = intent_seed,
             .focus_target = .{ .x = 480, .y = 270 },
-            .scope_dense_indices = ai_indices,
+            .scope_dense_indices = ai_cognition_indices,
+            .spatial_population_indices = ai_halo_indices,
         });
         _ = try ctx.collision.updateSerialScoped(&fixture.data, &fixture.contacts, collision_indices);
         var slice = fixture.data.movementBodySlice();
@@ -337,7 +344,7 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
         ctx.scope.deriveChunksSerial(&fixture.data, chunk_grid);
         // Tier policy reads the chunk just derived; serial path emits one range.
         try ctx.scope.queueTierChangesSerial(&fixture.data, visibleRegion(), &fixture.frame.structural_commands);
-        return .{ .batch = suite.serialBatch(move_slice_const.entities.len, movement_range_alignment_items), .active_cognition = ai_indices.len, .excluded_ns = excluded_ns };
+        return .{ .batch = suite.serialBatch(move_slice_const.entities.len, movement_range_alignment_items), .active_cognition = ai_cognition_indices.len, .excluded_ns = excluded_ns };
     }
 
     _ = try ctx.ai.update(ai_slice, move_slice_const, spatial_view, &fixture.data, &fixture.frame, thread_system.?, delta_seconds, .{
@@ -346,7 +353,8 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
         .adaptive = ctx.case.adaptive,
         .intent_seed = intent_seed,
         .focus_target = .{ .x = 480, .y = 270 },
-        .scope_dense_indices = ai_indices,
+        .scope_dense_indices = ai_cognition_indices,
+        .spatial_population_indices = ai_halo_indices,
     });
     _ = try ctx.collision.update(&fixture.data, &fixture.contacts, thread_system.?, .{
         .items_per_range = itemsPerRange(ctx.case, collision_range_alignment_items),
@@ -365,7 +373,7 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
     _ = ctx.scope.deriveChunks(&fixture.data, thread_system.?, chunk_grid, scope_config);
     // Threaded tier policy trains its own tuner inside the measured window.
     _ = try ctx.scope.queueTierChanges(&fixture.data, visibleRegion(), &fixture.frame.structural_commands, thread_system.?, scope_config);
-    return .{ .batch = move_stats.batch, .active_cognition = ai_indices.len, .excluded_ns = excluded_ns };
+    return .{ .batch = move_stats.batch, .active_cognition = ai_cognition_indices.len, .excluded_ns = excluded_ns };
 }
 
 /// Scope-pass threading config for a case: adaptive cases let the scope tuners
